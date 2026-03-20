@@ -1,0 +1,14 @@
+# 忽略大模型文件
+*.gguf
+
+# 忽略下载的程序压缩包和二进制文件
+ollama*
+*.tar.gz
+*.tar.zst
+
+# 忽略运行日志
+*.log
+
+# 忽略 Python 缓存
+__pycache__/
+wget-log

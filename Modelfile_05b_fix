@@ -1,0 +1,10 @@
+FROM /root/.cache/modelscope/hub/models/qwen/Qwen2___5-0___5B-Instruct-GGUF/qwen2.5-0.5b-instruct-q4_k_m.gguf
+
+TEMPLATE """{{ if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+<|im_start|>assistant
+"""
+PARAMETER stop "<|im_start|>"
+PARAMETER stop "<|im_end|>"
