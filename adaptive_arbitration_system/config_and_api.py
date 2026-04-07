@@ -12,10 +12,14 @@ config_and_api.py
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Dict, Tuple
 
 import requests
+
+# 强制本地 Ollama 请求绕过任何系统代理，避免 127.0.0.1 被错误代理转发。
+os.environ["NO_PROXY"] = "127.0.0.1,localhost"
 
 # ===== 全局配置 =====
 # 直接指向 Ollama 的 generate 接口（按你的项目环境固定为本地服务）。
@@ -29,7 +33,8 @@ MODEL_REGISTRY: Dict[str, Dict[str, Any]] = {
 }
 
 # 默认超时时间（秒）。
-DEFAULT_TIMEOUT = 180
+# 保持 requests.post 的 timeout=120 设定。
+DEFAULT_TIMEOUT = 120
 
 
 class LLMAPIError(RuntimeError):
@@ -47,7 +52,7 @@ def call_llm(model_name: str, prompt: str, timeout: int = DEFAULT_TIMEOUT) -> Tu
     参数：
     - model_name: 目标模型名称（必须在 MODEL_REGISTRY 中）。
     - prompt: 输入提示词。
-    - timeout: 请求超时阈值，默认 180 秒。
+    - timeout: 请求超时阈值，默认 120 秒。
 
     返回：
     - response_text: 模型回复文本。
@@ -59,6 +64,9 @@ def call_llm(model_name: str, prompt: str, timeout: int = DEFAULT_TIMEOUT) -> Tu
     """
     if model_name not in MODEL_REGISTRY:
         raise ValueError(f"未知模型：{model_name}，可用模型：{list(MODEL_REGISTRY.keys())}")
+
+    # 给操作系统和模型调度预留更充足的喘息时间，降低高频切换场景下 502 风险。
+    time.sleep(1.5)
 
     payload = {
         "model": model_name,

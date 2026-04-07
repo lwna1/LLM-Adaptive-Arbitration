@@ -2,84 +2,112 @@
 device_simulator.py
 -------------------
 本模块用于模拟端侧设备状态：
-- 电量（battery）随模型调用逐步衰减。
-- 温度（temperature）随模型调用逐步升高。
-- 每个请求结束后可调用 cool_down() 模拟自然降温。
+- 电量（battery）按“功率 * 推理耗时”的动态能耗模型衰减。
+- 温度（temperature）按任务能量输入升高，并叠加牛顿冷却模型散热。
+
+核心说明：
+- 引入基于时间的动态能耗与冷却模型，替代固定扣电/固定升温逻辑。
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from typing import Dict, Tuple
+from typing import Dict
 
 
 @dataclass
 class DeviceSimulator:
     """
-    端侧设备状态仿真器。
+    端侧设备状态仿真器（Time-Aware 版本）。
 
     初始状态：
     - battery = 100.0 (%)
     - temperature = 35.0 (℃)
+
+    模型额定功率（W）：
+    - qwen-0.5b: 5.0
+    - llama-1b: 10.0
+    - qwen-1.5b: 20.0
+
+    状态更新公式：
+    - E = Power * inference_time_seconds
+    - battery = max(0, battery - E * 0.015)
+    - temp_rise = E * 0.04
+    - T_next = T_env + (T_curr - T_env) * exp(-k)
+      其中 T_curr 为“升温后的温度”，T_env=25.0，k=0.1
     """
 
     battery: float = 100.0
     temperature: float = 35.0
+    env_temperature: float = 25.0
+    cooling_k: float = 0.1
 
-    # 不同模型对硬件状态的影响：
-    # 映射关系为 model_name -> (battery_drop, temperature_rise)
-    model_impact: Dict[str, Tuple[float, float]] = field(
+    # 不同模型额定功率（单位：W）
+    model_power_watts: Dict[str, float] = field(
         default_factory=lambda: {
-            "qwen-0.5b": (0.5, 0.5),
-            "llama-1b": (1.5, 1.5),
-            "qwen-1.5b": (3.0, 3.0),
+            "qwen-0.5b": 5.0,
+            "llama-1b": 10.0,
+            "qwen-1.5b": 20.0,
         }
     )
 
-    def update_state(self, model_name: str) -> None:
+    def _apply_newton_cooling(self, temp_curr: float) -> float:
         """
-        在每次模型调用后更新设备状态。
+        牛顿冷却（离散步）：
+        T_next = T_env + (T_curr - T_env) * e^(-k)
+        """
+        temp_next = self.env_temperature + (temp_curr - self.env_temperature) * math.exp(-self.cooling_k)
+        return max(self.env_temperature, temp_next)
 
-        规则：
-        - qwen-0.5b：battery -= 0.5, temperature += 0.5
-        - llama-1b： battery -= 1.5, temperature += 1.5
-        - qwen-1.5b：battery -= 3.0, temperature += 3.0
+    def update_state(self, model_name: str, inference_time_seconds: float) -> None:
         """
-        if model_name not in self.model_impact:
+        在每次模型调用后更新设备状态（闭环入口）。
+
+        参数：
+        - model_name: 模型名称
+        - inference_time_seconds: 本次推理耗时（秒）
+        """
+        if model_name not in self.model_power_watts:
             raise ValueError(f"未知模型：{model_name}")
 
-        battery_drop, temperature_rise = self.model_impact[model_name]
-        self.battery = max(0.0, round(self.battery - battery_drop, 2))
-        self.temperature = round(self.temperature + temperature_rise, 2)
+        # 防御性处理：避免负耗时导致“反向充电/降温”。
+        elapsed = max(0.0, float(inference_time_seconds))
+        power = self.model_power_watts[model_name]
+
+        # 动态能耗计算：E = P * t
+        energy = power * elapsed
+
+        # 电量衰减：battery = max(0, battery - E * 0.015)
+        self.battery = max(0.0, self.battery - energy * 0.002)
+
+        # 温度上升后再执行自然散热，模拟“发热 + 冷却”叠加过程。
+        temp_after_rise = self.temperature + energy * 0.025
+        self.temperature = self._apply_newton_cooling(temp_after_rise)
+
+        # 统一保留两位小数，便于日志和 CSV 可读性。
+        self.battery = round(self.battery, 2)
+        self.temperature = round(self.temperature, 2)
 
     def cool_down(self) -> None:
         """
-        每次完整请求结束后执行一次降温。
+        额外散热接口（兼容旧跑批脚本）。
 
-        规则：
-        - temperature 降低 1.0℃
-        - 最低不低于 35.0℃
+        说明：
+        - 该方法不再绑定固定降温值，而是沿用牛顿冷却。
+        - update_state 已内置一次冷却；该方法可用于“请求间隙”的补充散热。
         """
-        self.temperature = round(max(35.0, self.temperature - 1.0), 2)
+        self.temperature = round(self._apply_newton_cooling(self.temperature), 2)
 
-    def get_hardware_constraint(self) -> str:
+    def get_state(self) -> Dict[str, float]:
         """
-        根据当前电量与温度评估硬件约束等级。
+        返回当前设备状态。
 
-        约束规则（按优先级从高到低）：
-        1) 若 temperature >= 45.0 或 battery <= 15.0
-           -> "THROTTLED_05B"（严重受限）
-
-        2) 若 temperature >= 40.0 或 battery <= 30.0
-           -> "THROTTLED_1B"（轻度受限）
-
-        3) 其余
-           -> "NORMAL"
+        返回：
+        - battery: 当前电量百分比（0~100）
+        - temperature: 当前温度（℃）
         """
-        if self.temperature >= 45.0 or self.battery <= 15.0:
-            return "THROTTLED_05B"
-
-        if self.temperature >= 40.0 or self.battery <= 30.0:
-            return "THROTTLED_1B"
-
-        return "NORMAL"
+        return {
+            "battery": round(self.battery, 2),
+            "temperature": round(self.temperature, 2),
+        }

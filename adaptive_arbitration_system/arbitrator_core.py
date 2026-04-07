@@ -2,197 +2,301 @@
 arbitrator_core.py
 ------------------
 本模块是混合自适应仲裁系统的核心调度大脑，负责：
-1. 融合“难度预测 + 硬件状态”进行首次路由。
-2. 对输出做质量检测。
-3. 在质量不达标时进行级联升级（Cascade Retry）。
+1. 融合“难度预测 + Safety Score”进行动态路由与自适应降级。
+2. 通过零参数轻量质量评估器执行端侧低开销回复验收。
+3. 在每次调用后进行状态回写，形成“时间-能耗-温度-路由”闭环。
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+import re
+from collections import Counter
+from typing import Dict, List, Optional, Tuple
 
 from config_and_api import LLMAPIError, call_llm
 from device_simulator import DeviceSimulator
 from ml_router_upgrade.feature_extractor import predict_difficulty
 
 
-# 模型从小到大顺序，用于级联升级判断。
 MODEL_ORDER = ["qwen-0.5b", "llama-1b", "qwen-1.5b"]
 
-# 拒答/低质量关键词，命中即视为可能不达标。
-REFUSAL_KEYWORDS = [
-    "不知道",
-    "抱歉",
-    "作为一个AI",
+REFUSAL_PATTERNS = [
+    "我是一个人工智能",
+    "作为一个人工智能",
     "无法回答",
+    "我无法回答",
+    "不能回答",
     "缺乏信息",
 ]
 
-# 针对 llama-1b 的特定风险词（系统日志幻觉）。
-LLAMA_HALLUCINATION_KEYWORDS = [
-    "任务列表",
-    "系统状态",
-]
+ACK_WORDS = {
+    "收到",
+    "好的",
+    "明白",
+    "已收到",
+    "了解",
+    "ok",
+    "okay",
+}
+
+
+def _detect_severe_repetition(answer: str) -> bool:
+    """
+    复读机检测（Repetition）。
+    """
+    text = (answer or "").strip()
+    if not text:
+        return False
+
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) < 12:
+        return False
+
+    # 连续子串重复检测（如 abcabcabc）。
+    max_chunk_len = min(12, len(compact) // 3)
+    for chunk_len in range(2, max_chunk_len + 1):
+        limit = len(compact) - chunk_len * 3 + 1
+        for i in range(limit):
+            chunk = compact[i : i + chunk_len]
+            if compact[i : i + chunk_len * 3] == chunk * 3:
+                return True
+
+    # 分句重复检测（同一句段重复 >= 3）。
+    segments = [seg.strip() for seg in re.split(r"[。！？!?；;\n，,]", text) if seg.strip()]
+    if len(segments) >= 3:
+        seg_counter = Counter(segments)
+        if max(seg_counter.values()) >= 3:
+            return True
+
+    return False
+
+
+def evaluate_answer_quality(prompt: str, answer: str) -> Tuple[bool, str]:
+    """
+    零参数轻量级质量评估器。
+
+    返回：
+    - (True, "OK"): 合格
+    - (False, "原因"): 不合格
+    """
+    prompt_text = (prompt or "").strip()
+    answer_text = (answer or "").strip()
+
+    if not answer_text:
+        return False, "空回复"
+
+    # 1) 复读机检测
+    if _detect_severe_repetition(answer_text):
+        return False, "复读机输出"
+
+    # 2) 长问短答（并排除简单确认词）
+    if len(prompt_text) > 20 and len(answer_text) < 10:
+        if answer_text.lower() not in ACK_WORDS and answer_text not in ACK_WORDS:
+            return False, "长问短答且疑似敷衍"
+
+    # 3) 任务格式匹配
+    prompt_lower = prompt_text.lower()
+    if any(key in prompt_lower for key in ["代码", "实现", "python", "c++"]):
+        if "```" not in answer_text:
+            return False, "代码任务缺少代码块"
+
+    if any(key in prompt_text for key in ["翻译", "英语"]):
+        if re.search(r"[A-Za-z]", answer_text) is None:
+            return False, "翻译任务缺少英文内容"
+
+    # 4) 拒答检测
+    if any(pattern in answer_text for pattern in REFUSAL_PATTERNS):
+        return False, "模型拒答"
+
+    return True, "OK"
 
 
 class AdaptiveArbitrator:
     """
-    多目标仲裁器：
-    - 目标 1：在硬件约束下尽量选择合适算力模型。
-    - 目标 2：在输出质量不佳时尽可能进行级联补救。
-    - 目标 3：记录全链路耗时与平均 TPS，用于后续实验统计。
+    动态仲裁器：
+    - 难度预测：由 RF/MLP 路由引擎给出 difficulty。
+    - 安全决策：由 battery + temperature 计算 Safety Score。
+    - 质量闭环：低质量回复触发向上级联重试。
     """
 
-    def __init__(self, device: Optional[DeviceSimulator] = None) -> None:
-        self.device = device or DeviceSimulator()
+    def __init__(
+        self,
+        device_simulator: Optional[DeviceSimulator] = None,
+        routing_engine: str = "rf",
+    ) -> None:
+        self.simulator = device_simulator or DeviceSimulator()
+        # 兼容旧代码可能引用 self.device 的场景。
+        self.device = self.simulator
+        self.routing_engine = routing_engine
 
     @staticmethod
-    def _difficulty_to_model(difficulty: int) -> str:
-        """NORMAL 情况下的默认映射：1->0.5B, 2->1B, 3->1.5B。"""
-        mapping = {
-            1: "qwen-0.5b",
-            2: "llama-1b",
-            3: "qwen-1.5b",
-        }
-        return mapping.get(difficulty, "llama-1b")
+    def _calculate_safety_score(battery: float, temp: float) -> float:
+        """
+        Safety Score：
+        score = (battery * 0.6) - ((temp - 25) * 1.5)
+        """
+        return (battery * 0.6) - ((temp - 25.0) * 1.5)
+
+    def _get_safety_score(self) -> float:
+        state = self.simulator.get_state()
+        return self._calculate_safety_score(float(state["battery"]), float(state["temperature"]))
 
     @staticmethod
-    def _constraint_max_model(constraint: str) -> str:
-        """根据硬件约束返回当前可用的最大模型。"""
-        if constraint == "THROTTLED_05B":
-            return "qwen-0.5b"
-        if constraint == "THROTTLED_1B":
-            return "llama-1b"
-        return "qwen-1.5b"
-
-    def _clip_model_by_constraint(self, model_name: str, constraint: str) -> str:
-        """若候选模型超过约束上限，则截断到约束允许的最大模型。"""
-        max_model = self._constraint_max_model(constraint)
-        if MODEL_ORDER.index(model_name) > MODEL_ORDER.index(max_model):
-            return max_model
-        return model_name
-
-    def _select_initial_model(self, difficulty: int, constraint: str) -> str:
-        """
-        首次路由策略（严格对应你的需求）：
-        1) THROTTLED_05B: 强制 0.5B。
-        2) THROTTLED_1B: 难度映射后再截断到 1B。
-        3) NORMAL: 1->0.5B, 2->1B, 3->1.5B。
-        """
-        if constraint == "THROTTLED_05B":
-            return "qwen-0.5b"
-
-        preferred = self._difficulty_to_model(difficulty)
-
-        if constraint == "THROTTLED_1B":
-            return self._clip_model_by_constraint(preferred, constraint)
-
-        return preferred
-
-    @staticmethod
-    def _is_unqualified(answer: str, difficulty: int, model_name: str) -> bool:
-        """
-        质量评估：输出是否不达标。
-
-        不达标规则：
-        1) 包含拒答词。
-        2) 对 Level 2/3 问题，回答长度 < 10 字。
-        3) 若模型为 llama-1b，且包含“任务列表/系统状态”等幻觉词。
-        """
-        text = (answer or "").strip()
-
-        if any(word in text for word in REFUSAL_KEYWORDS):
-            return True
-
-        if difficulty in (2, 3) and len(text) < 10:
-            return True
-
-        if model_name == "llama-1b" and any(word in text for word in LLAMA_HALLUCINATION_KEYWORDS):
-            return True
-
-        return False
-
-    @staticmethod
-    def _next_model(current_model: str) -> str:
-        """返回下一个更大模型；若已是最大模型则返回自身。"""
-        idx = MODEL_ORDER.index(current_model)
+    def _next_model(model_name: str) -> str:
+        """返回下一个更大模型；若已最大则返回自身。"""
+        idx = MODEL_ORDER.index(model_name)
         if idx >= len(MODEL_ORDER) - 1:
-            return current_model
+            return model_name
         return MODEL_ORDER[idx + 1]
 
-    def _can_upgrade(self, current_model: str, constraint: str) -> bool:
+    def _max_model_for_request(self, difficulty: int, score: float) -> str:
         """
-        判断在当前约束下是否还能升级到更大模型。
-        例如：
-        - THROTTLED_1B 下，llama-1b 不能再升到 1.5b。
-        - NORMAL 下，0.5b/1b 都可继续升级。
+        根据任务难度与安全分，得到“当前允许的最大模型”。
+
+        规则：
+        - 全局极限保护：score < -10 -> 仅 qwen-0.5b
+        - Level 3：score > 20 才允许 qwen-1.5b，否则最多 llama-1b
+        - Level 2：score > 0 才允许 llama-1b，否则最多 qwen-0.5b
         """
-        max_model = self._constraint_max_model(constraint)
-        return MODEL_ORDER.index(current_model) < MODEL_ORDER.index(max_model)
+        if score < -10:
+            return "qwen-0.5b"
+
+        if difficulty >= 3:
+            return "qwen-1.5b" if score > 20 else "llama-1b"
+
+        if difficulty == 2:
+            if score > 20:
+                return "qwen-1.5b"
+            return "llama-1b" if score > 0 else "qwen-0.5b"
+
+        # Level 1：默认 0.5b，若安全分较高可允许后续升级补救。
+        if score > 20:
+            return "qwen-1.5b"
+        if score > 0:
+            return "llama-1b"
+        return "qwen-0.5b"
+
+    def _select_initial_model(self, difficulty: int, score: float, chain_logs: List[str]) -> str:
+        """
+        初始路由（含前置降级）。
+        """
+        if score < -10:
+            chain_logs.append(f"[受限降级]score={score:.2f},强制:qwen-0.5b")
+            return "qwen-0.5b"
+
+        if difficulty >= 3:
+            if score > 20:
+                return "qwen-1.5b"
+            chain_logs.append(f"[受限降级]score={score:.2f},跳过:qwen-1.5b")
+            return "llama-1b"
+
+        if difficulty == 2:
+            if score > 0:
+                return "llama-1b"
+            chain_logs.append(f"[受限降级]score={score:.2f},跳过:llama-1b")
+            return "qwen-0.5b"
+
+        return "qwen-0.5b"
 
     def adaptive_process(self, prompt: str) -> Dict[str, object]:
         """
-        执行完整的“路由 + 推理 + 质量评估 + 级联补救”流程。
+        动态级联主循环：
+        1) 预测难度并进行安全分选模。
+        2) 调用模型并做质量评估。
+        3) 不合格则尝试向上升级重试，直到成功或受限。
 
-        返回字段：
-        - answer: 最终答案
-        - total_latency: 全部调用累计耗时（秒）
-        - avg_tps: 平均 TPS
-        - call_chain: 实际调用模型链路（按顺序）
-        - difficulty: 系统预测难度（便于上层 benchmark 直接记录）
+        关键实现：
+        - 引入基于时间的动态能耗与冷却模型。
+        - 每次调用后立刻用耗时回写仿真状态（含异常/被拦截场景）。
         """
-        difficulty = predict_difficulty(prompt)
-        initial_constraint = self.device.get_hardware_constraint()
-        current_model = self._select_initial_model(difficulty, initial_constraint)
+        difficulty = predict_difficulty(prompt, engine=self.routing_engine)
+        chain_logs: List[str] = []
 
-        call_chain: List[str] = []
         total_latency = 0.0
         tps_values: List[float] = []
         final_answer = ""
 
+        initial_score = self._get_safety_score()
+        current_model = self._select_initial_model(difficulty, initial_score, chain_logs)
+        chain_logs.append(f"[初始路由]{current_model}(score={initial_score:.2f})")
+
         while True:
-            # A. 先执行一次模型调用，并将本次调用带来的硬件损耗计入状态。
-            self.device.update_state(current_model)
-            call_chain.append(current_model)
+            chain_logs.append(f"[调用]{current_model}")
 
             api_failed = False
+            failure_reason = ""
+            answer = ""
+            latency = 0.0
+            tps = 0.0
+
             try:
                 answer, latency, tps = call_llm(current_model, prompt)
             except LLMAPIError as exc:
-                # 调用失败同样视作一次低质量结果，后续会按策略尝试级联补救。
-                answer = f"[模型调用异常] {exc}"
+                api_failed = True
+                failure_reason = f"调用异常:{exc}"
+                answer = f"[模型调用异常]{exc}"
                 latency = float(getattr(exc, "latency", 0.0))
                 tps = 0.0
+            except Exception as exc:  # 防御性兜底
                 api_failed = True
+                failure_reason = f"未知异常:{exc}"
+                answer = f"[模型调用未知异常]{exc}"
+                latency = 0.0
+                tps = 0.0
 
-            total_latency += latency
+            elapsed = max(0.0, float(latency))
+
+            # 状态闭环回写：只要消耗了时间，就立刻更新能耗与温度。
+            # 引入基于时间的动态能耗与冷却模型。
+            self.simulator.update_state(current_model, elapsed)
+            chain_logs.append(f"[状态回写]{current_model}|t={elapsed:.3f}s")
+
+            total_latency += elapsed
             if tps > 0:
                 tps_values.append(tps)
 
-            final_answer = answer.strip()
-            unqualified = api_failed or self._is_unqualified(final_answer, difficulty, current_model)
+            if api_failed:
+                quality_ok, quality_reason = False, failure_reason
+            else:
+                quality_ok, quality_reason = evaluate_answer_quality(prompt, answer)
 
-            # B. 质量达标，直接结束。
-            if not unqualified:
+            if quality_ok:
+                final_answer = (answer or "").strip()
+                chain_logs.append("[质量通过]")
                 break
 
-            # C. 质量不达标 -> 判断当前硬件是否允许继续升级。
-            current_constraint = self.device.get_hardware_constraint()
-            if self._can_upgrade(current_model, current_constraint):
-                current_model = self._next_model(current_model)
+            chain_logs.append(f"[质量拦截:{quality_reason}]")
+
+            # 到达最大模型则妥协接受，避免死循环。
+            if current_model == "qwen-1.5b":
+                final_answer = f"[妥协输出]{(answer or '').strip()}"
+                chain_logs.append("qwen-1.5b[妥协输出]")
+                break
+
+            # 根据最新状态动态判断是否还能升级。
+            now_score = self._get_safety_score()
+            max_model = self._max_model_for_request(difficulty, now_score)
+            next_model = self._next_model(current_model)
+
+            if MODEL_ORDER.index(next_model) <= MODEL_ORDER.index(max_model):
+                chain_logs.append(f"[升级重试]{current_model}->{next_model}(score={now_score:.2f})")
+                current_model = next_model
                 continue
 
-            # 已受限且不能升级：按要求拼接硬件限制提示并终止级联。
-            if current_constraint in ("THROTTLED_05B", "THROTTLED_1B"):
-                final_answer = f"[受硬件过热限制，强制终止级联]{final_answer}"
+            chain_logs.append(f"[受限降级]score={now_score:.2f},无法升级到:{next_model}")
+            final_answer = f"[受硬件限制，无法继续升级]{(answer or '').strip()}"
             break
 
         avg_tps = sum(tps_values) / len(tps_values) if tps_values else 0.0
+        final_score = self._get_safety_score()
+        chain_text = " -> ".join(chain_logs)
 
         return {
             "answer": final_answer,
             "total_latency": round(total_latency, 4),
             "avg_tps": round(avg_tps, 4),
-            "call_chain": call_chain,
+            "call_chain": chain_logs,  # 兼容旧调用方（列表）
+            "call_chain_text": chain_text,  # 新增：直接可写入 CSV 的链路文本
             "difficulty": difficulty,
+            "safety_score": round(final_score, 4),
         }

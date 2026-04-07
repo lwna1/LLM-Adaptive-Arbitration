@@ -150,17 +150,19 @@ def _symbol_density(text: str) -> float:
     计算特殊符号密度。
 
     定义：
-        symbol_density = 符号字符总数 / 文本总字符数
+        symbol_density = 符号字符总数 / (文本总字符数 + 15)
 
     作用：
     - 对包含代码、公式、逻辑推理符号的文本更敏感。
-    - 与 length / entropy 形成互补，提升分类器区分“复杂推理题”的能力。
+    - 采用分母平滑后，可抑制极短文本因分母过小造成的密度虚高问题。
+      例如“1+1等于几”这类短文本，不会因单个符号被放大为“高难任务”。
     """
     if not text:
         return 0.0
 
     symbol_count = sum(1 for ch in text if ch in SYMBOL_SET)
-    return symbol_count / len(text)
+    length = len(text)
+    return symbol_count / (length + 15)
 
 
 def extract_features(prompt: str) -> List[float]:
@@ -174,7 +176,7 @@ def extract_features(prompt: str) -> List[float]:
     - [length, entropy, noun_ratio, verb_ratio, symbol_density, keyword_hit]
 
     说明：
-    - length 使用绝对字符长度（int -> float），反映任务规模。
+    - length 使用 log(length + 1) 做对数平滑，收敛长尾分布并减小量纲差异。
     - entropy 反映文本信息复杂度。
     - noun_ratio / verb_ratio 反映语义构成。
     - symbol_density 反映逻辑/代码符号负载。
@@ -186,7 +188,8 @@ def extract_features(prompt: str) -> List[float]:
     if not text:
         return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-    length = float(len(text))
+    raw_length = len(text)
+    length = float(math.log(raw_length + 1))
     entropy = float(_shannon_entropy(text))
 
     tokens = _extract_tokens(text)
