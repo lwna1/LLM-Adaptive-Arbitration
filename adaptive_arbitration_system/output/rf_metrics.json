@@ -1,42 +1,42 @@
 {
-  "accuracy": 0.95,
-  "precision_macro": 0.9530748663101605,
-  "recall_macro": 0.9500000000000001,
-  "f1_macro": 0.9495290258509134,
-  "precision_weighted": 0.9530748663101605,
-  "recall_weighted": 0.95,
-  "f1_weighted": 0.9495290258509134,
+  "accuracy": 0.8742857142857143,
+  "precision_macro": 0.8855452065762393,
+  "recall_macro": 0.8749132718802656,
+  "f1_macro": 0.8754702744742967,
+  "precision_weighted": 0.8869504097593099,
+  "recall_weighted": 0.8742857142857143,
+  "f1_weighted": 0.8758991385936415,
   "full_report": {
     "1": {
-      "precision": 0.9,
-      "recall": 0.99,
-      "f1-score": 0.9428571428571428,
-      "support": 100.0
+      "precision": 0.762589928057554,
+      "recall": 0.9298245614035088,
+      "f1-score": 0.8379446640316206,
+      "support": 114.0
     },
     "2": {
-      "precision": 0.9705882352941176,
-      "recall": 0.99,
-      "f1-score": 0.9801980198019802,
-      "support": 100.0
+      "precision": 0.9215686274509803,
+      "recall": 0.7966101694915254,
+      "f1-score": 0.8545454545454545,
+      "support": 118.0
     },
     "3": {
-      "precision": 0.9886363636363636,
-      "recall": 0.87,
-      "f1-score": 0.925531914893617,
-      "support": 100.0
+      "precision": 0.9724770642201835,
+      "recall": 0.8983050847457628,
+      "f1-score": 0.933920704845815,
+      "support": 118.0
     },
-    "accuracy": 0.95,
+    "accuracy": 0.8742857142857143,
     "macro avg": {
-      "precision": 0.9530748663101605,
-      "recall": 0.9500000000000001,
-      "f1-score": 0.9495290258509134,
-      "support": 300.0
+      "precision": 0.8855452065762393,
+      "recall": 0.8749132718802656,
+      "f1-score": 0.8754702744742967,
+      "support": 350.0
     },
     "weighted avg": {
-      "precision": 0.9530748663101605,
-      "recall": 0.95,
-      "f1-score": 0.9495290258509134,
-      "support": 300.0
+      "precision": 0.8869504097593099,
+      "recall": 0.8742857142857143,
+      "f1-score": 0.8758991385936415,
+      "support": 350.0
     }
   }
 }

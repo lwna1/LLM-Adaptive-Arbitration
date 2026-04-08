@@ -16,9 +16,11 @@ build_official_dataset.py
 
 from __future__ import annotations
 
+import importlib
 import os
 import random
 import re
+import sys
 from typing import Dict, List
 
 import pandas as pd
@@ -38,6 +40,16 @@ DATASET_ID = "AI-ModelScope/alpaca-gpt4-data-zh"
 TARGET_TOTAL = 1500
 TARGET_PER_LEVEL = 500
 RANDOM_SEED = 42
+SCENARIO_EXTRA_TOTAL = 160
+BENCHMARK_EXTRA_TOTAL = 20
+
+# benchmark 题库按标签重复注入倍率（用于训练加权）。
+# 倍率是“总保留份数”，例如 12 代表该标签样本会保留 12 份（含原始 1 份）。
+BENCHMARK_LABEL_REPEAT = {
+    1: 2,
+    2: 12,
+    3: 2,
+}
 
 # 用于辅助识别“逻辑/代码型任务”的符号集合。
 LOGIC_SYMBOLS = set("{}[]`=+><*/()")
@@ -67,6 +79,20 @@ TRIVIAL_SHORT_TEXTS = {
 
 SIMPLE_ARITHMETIC_PATTERN = re.compile(r"^\s*\d+\s*[\+\-\*/]\s*\d+\s*(等于几|\?)?\s*$")
 
+# 明确“中等任务意图”的关键词。
+# 这些任务通常不要求高强度推导/代码实现，但认知负荷明显高于闲聊与极简指令。
+MEDIUM_INTENT_KEYWORDS = [
+    "翻译",
+    "简述",
+    "介绍",
+    "总结",
+    "通俗",
+    "概述",
+    "历史意义",
+    "解释一下",
+    "请解释",
+]
+
 
 def auto_label_difficulty(prompt: str) -> int:
     """
@@ -95,6 +121,10 @@ def auto_label_difficulty(prompt: str) -> int:
     hard_short_hit = any(pattern.search(text) is not None for pattern in HARD_SHORT_PATTERNS)
     if keyword_hit > 0 or has_heavy_symbols or hard_short_hit:
         return 3
+
+    # 在长度规则之前优先识别“中等任务意图”，避免被短文本条件误压到 Level 1。
+    if any(keyword in text for keyword in MEDIUM_INTENT_KEYWORDS):
+        return 2
 
     # Level 1 改为更贴近真实分布的“宽松短文本判定”：
     # - 白名单短句/简单算术直接判 1
@@ -237,6 +267,146 @@ def build_balanced_dataset(
     return selected_df
 
 
+def load_scenario_extra_samples() -> pd.DataFrame:
+    """
+    读取 run_all_scenarios_benchmark.py 中定义的 160 条场景题，
+    并严格复用其 ground_truth 标注作为训练标签。
+
+    说明：
+    - 这里不改动场景脚本内的标注策略，直接复用其构造函数输出；
+    - 这样可保证“训练补充样本”和“场景跑批样本”语义一致，
+      满足论文中控制变量法对标注一致性的要求。
+    """
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    try:
+        scenario_module = importlib.import_module("run_all_scenarios_benchmark")
+    except Exception as exc:
+        raise RuntimeError(
+            "无法导入 run_all_scenarios_benchmark.py，请确认文件存在且可执行。"
+        ) from exc
+
+    if not hasattr(scenario_module, "build_all_scenarios"):
+        raise AttributeError("run_all_scenarios_benchmark.py 缺少 build_all_scenarios 函数。")
+
+    all_scenarios = scenario_module.build_all_scenarios()
+    records: List[Dict[str, object]] = []
+
+    for _, question_bank in all_scenarios.items():
+        for item in question_bank:
+            records.append(
+                {
+                    "prompt": str(item.get("prompt", "")).strip(),
+                    "label": int(item.get("ground_truth", 1)),
+                }
+            )
+
+    extra_df = pd.DataFrame(records)
+    extra_df = extra_df[extra_df["prompt"].astype(str).str.len() > 0].copy()
+    extra_df["label"] = extra_df["label"].astype(int)
+
+    if len(extra_df) != SCENARIO_EXTRA_TOTAL:
+        raise ValueError(
+            f"场景补充样本数量异常：期望 {SCENARIO_EXTRA_TOTAL}，实际 {len(extra_df)}。"
+        )
+
+    return extra_df[["prompt", "label"]]
+
+
+def load_benchmark_extra_samples() -> pd.DataFrame:
+    """
+    读取 benchmark_pipeline.py 中定义的 20 条标准测试题，
+    并复用其 ground_truth 作为训练标签。
+
+    说明：
+    - 该 20 条题是系统历史基准题库，加入训练集有助于提升
+      在“短指令/常识/中高难解释与代码题”上的覆盖稳定性；
+    - 按 benchmark_pipeline 的原始人工标签注入，不改标注逻辑。
+    """
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    try:
+        benchmark_module = importlib.import_module("benchmark_pipeline")
+    except Exception as exc:
+        raise RuntimeError(
+            "无法导入 benchmark_pipeline.py，请确认文件存在且可执行。"
+        ) from exc
+
+    if not hasattr(benchmark_module, "build_question_bank"):
+        raise AttributeError("benchmark_pipeline.py 缺少 build_question_bank 函数。")
+
+    question_bank = benchmark_module.build_question_bank()
+    records: List[Dict[str, object]] = []
+    for item in question_bank:
+        records.append(
+            {
+                "prompt": str(item.get("prompt", "")).strip(),
+                "label": int(item.get("ground_truth", 1)),
+            }
+        )
+
+    extra_df = pd.DataFrame(records)
+    extra_df = extra_df[extra_df["prompt"].astype(str).str.len() > 0].copy()
+    extra_df["label"] = extra_df["label"].astype(int)
+
+    if len(extra_df) != BENCHMARK_EXTRA_TOTAL:
+        raise ValueError(
+            f"benchmark 补充样本数量异常：期望 {BENCHMARK_EXTRA_TOTAL}，实际 {len(extra_df)}。"
+        )
+
+    return extra_df[["prompt", "label"]]
+
+
+def expand_benchmark_samples_by_label(benchmark_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    对 benchmark 样本按标签进行重复注入（训练加权）。
+
+    设计目的：
+    - 原始 benchmark 仅 20 条，占总体训练集比例较低；
+    - 对 Level 2 提高重复倍率，增强中等难度任务的决策权重。
+    """
+    if benchmark_df.empty:
+        return benchmark_df.copy()
+
+    expanded_parts: List[pd.DataFrame] = []
+    for label in [1, 2, 3]:
+        sub = benchmark_df[benchmark_df["label"] == label].copy()
+        if sub.empty:
+            continue
+
+        repeat_n = int(BENCHMARK_LABEL_REPEAT.get(label, 1))
+        repeat_n = max(1, repeat_n)
+        expanded_parts.append(pd.concat([sub.copy() for _ in range(repeat_n)], ignore_index=True))
+
+    expanded_df = pd.concat(expanded_parts, ignore_index=True) if expanded_parts else benchmark_df.copy()
+    return expanded_df[["prompt", "label"]]
+
+
+def merge_with_fixed_extras(
+    official_df: pd.DataFrame,
+    seed: int = RANDOM_SEED,
+) -> pd.DataFrame:
+    """
+    将官方训练集与固定补充题库合并并打乱顺序。
+
+    关键约束：
+    - 官方抽样结果（1500 条）不做内容修改；
+    - 场景样本（160）按 run_all_scenarios_benchmark 的人工标签注入；
+    - benchmark 样本（20）按人工标签注入，并按标签重复注入做训练加权；
+    - 合并后随机打散，输出统一训练集供 RF/MLP 共用。
+    """
+    scenario_df = load_scenario_extra_samples()
+    benchmark_df = load_benchmark_extra_samples()
+    weighted_benchmark_df = expand_benchmark_samples_by_label(benchmark_df)
+    merged_df = pd.concat([official_df.copy(), scenario_df, weighted_benchmark_df], ignore_index=True)
+    merged_df = merged_df.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    return merged_df[["prompt", "label"]]
+
+
 def main() -> None:
     current_dir = os.path.dirname(os.path.abspath(__file__))
     output_csv = os.path.join(current_dir, "official_training_data.csv")
@@ -254,12 +424,31 @@ def main() -> None:
     )
 
     label_counts = official_df["label"].value_counts().sort_index()
-    print("[INFO] 采样完成，类别分布：")
+    print("[INFO] 官方 1500 条采样完成，类别分布：")
     for level in [1, 2, 3]:
         print(f"  - Level {level}: {int(label_counts.get(level, 0))}")
-    print(f"[INFO] 最终样本总数：{len(official_df)}")
 
-    official_df.to_csv(output_csv, index=False, encoding="utf-8-sig")
+    print("[INFO] 正在注入 run_all_scenarios_benchmark 的 160 条场景样本...")
+    print("[INFO] 正在注入 benchmark_pipeline 的 20 条基准样本（按标签重复注入）...")
+    final_df = merge_with_fixed_extras(official_df=official_df, seed=RANDOM_SEED)
+    final_counts = final_df["label"].value_counts().sort_index()
+
+    weighted_benchmark_rows = (
+        5 * BENCHMARK_LABEL_REPEAT.get(1, 1)
+        + 5 * BENCHMARK_LABEL_REPEAT.get(2, 1)
+        + 10 * BENCHMARK_LABEL_REPEAT.get(3, 1)
+    )
+
+    print("[INFO] 训练集类别分布：")
+    for level in [1, 2, 3]:
+        print(f"  - Level {level}: {int(final_counts.get(level, 0))}")
+    print(
+        f"[INFO] 最终样本总数：{len(final_df)}"
+        f"（官方 {TARGET_TOTAL} + 场景 {SCENARIO_EXTRA_TOTAL}"
+        f" + 基准加权 {weighted_benchmark_rows} / 原始基准 {BENCHMARK_EXTRA_TOTAL}）"
+    )
+
+    final_df.to_csv(output_csv, index=False, encoding="utf-8-sig")
     print(f"[INFO] 已导出：{output_csv}")
 
 

@@ -1,12 +1,12 @@
 """
 feature_extractor.py
 ====================
-在线推理接入模块：支持随机森林（RF）与多层感知机（MLP）双引擎热切换。
+在线推理接入模块：支持“Rule + MLP + RF”异构级联路由。
 
 目标：
-1. 保持统一接口：predict_difficulty(prompt: str, engine='rf') -> int
-2. 支持在随机森林与神经网络之间无缝切换。
-3. 在模型文件缺失时提供友好提示，便于排查部署问题。
+1. 保持统一接口：predict_difficulty(prompt: str) -> tuple[int, str]
+2. 先规则、再 MLP、后 RF 的三级漏斗决策。
+3. 返回“最终难度 + 决策引擎名称（Rule/MLP/RF）”。
 """
 
 from __future__ import annotations
@@ -197,10 +197,28 @@ _HARD_SHORT_PATTERNS = [
     re.compile(r"(快排|归并|最短路|并查集|哈希|拓扑|红黑树|线段树|贪心|递归)"),
 ]
 
+# 中等任务意图关键词（用于难度下限保护）。
+_MEDIUM_INTENT_KEYWORDS = [
+    "翻译",
+    "简述",
+    "介绍",
+    "总结",
+    "通俗",
+    "概述",
+    "历史意义",
+    "解释一下",
+    "请解释",
+]
+
 # Level 3 概率救援阈值：
-# 当模型主判为 Level 1 但 Level 3 概率足够高时，强制拉回到 Level 3。
+# 当模型主判为 Level 1 但类3概率足够高时，强制拉回到 Level 3。
 _RF_L3_RESCUE_THRESHOLD = 0.35
 _MLP_L3_RESCUE_THRESHOLD = 0.40
+
+# 决策引擎标签（用于 CSV/论文可解释性分析）
+DECISION_RULE = "Rule"
+DECISION_MLP = "MLP"
+DECISION_RF = "RF"
 
 
 def _is_light_hard_prompt(text: str) -> bool:
@@ -224,39 +242,16 @@ def _is_light_hard_prompt(text: str) -> bool:
     return any(pattern.search(text) is not None for pattern in _HARD_SHORT_PATTERNS)
 
 
-def _hard_floor_difficulty(text: str) -> int:
-    """
-    对“短且明确硬核”的 prompt 施加难度下限。
-
-    返回：
-    - 3: 明确硬核短文本（默认提升到困难）
-    - 0: 不触发
-    """
-    if len(text) <= 20 and _is_light_hard_prompt(text):
-        return 3
-    return 0
-
-
 def _should_short_circuit_level1(text: str) -> bool:
     """
-    前置启发式规则（收敛版）：
-    - 仅对“明确低负荷短文本”短路为 Level 1；
-    - 不再简单以“长度<=12 且无硬核词”粗暴短路，避免误伤短高难问题。
+    第一关规则防线：
+    - 极短文本（<=12）
+    - 且不含硬核编程/逻辑特征
+    满足即直接判为 Level 1。
     """
-    if len(text) > 12:
-        return False
-
-    if _is_light_hard_prompt(text):
-        return False
-
-    lowered = text.lower().strip()
-    if lowered in _TRIVIAL_SHORT_TEXTS:
+    if not text:
         return True
-
-    if _SIMPLE_ARITHMETIC_PATTERN.match(text):
-        return True
-
-    return False
+    return len(text) <= 12 and (not _is_light_hard_prompt(text))
 
 
 def _predict_with_rf(feats: np.ndarray) -> int:
@@ -310,49 +305,110 @@ def _predict_with_mlp(feats: np.ndarray) -> int:
     return pred_idx + 1
 
 
-def predict_difficulty(prompt: str, engine: str = "rf") -> int:
+def _clamp_level(level: int) -> int:
+    if level < 1:
+        return 1
+    if level > 3:
+        return 3
+    return level
+
+
+def predict_difficulty_with_trace(prompt: str, engine: str = "hybrid") -> Tuple[int, str, str]:
     """
-    统一难度预测接口。
+    统一难度预测接口（带流程追踪）。
 
     参数：
     - prompt: 输入文本
-    - engine: 路由引擎，支持 'rf' 或 'mlp'
+    - engine:
+      - "hybrid"（默认）并行机制：
+        A) Rule候选 -> MLP复核（仅MLP拍板）
+        B) 非Rule候选 -> MLP初判 -> RF终判
+      - "rf"：Rule -> RF（兼容旧评测）
+      - "mlp"：Rule -> MLP（兼容旧评测）
 
     返回：
-    - 1（简单）
-    - 2（中等）
-    - 3（困难）
+    - (difficulty, decision_engine, decision_flow)
+      difficulty: 1/2/3
+      decision_engine: Rule / MLP / RF
+      decision_flow: Rule/MLP/RF 判定规则切换流程
     """
     text = (prompt or "").strip()
+    mode = (engine or "hybrid").strip().lower()
 
-    # 加入启发式前置规则，处理短文本极端特征分布问题。
-    # 典型场景：如“1+1等于几”这类超短文本，避免被符号特征异常放大后误判为高难任务。
-    if _should_short_circuit_level1(text):
-        return 1
+    rule_hit = _should_short_circuit_level1(text)
 
-    hard_floor = _hard_floor_difficulty(text)
+    mlp_ready = _MLP_MODEL is not None and _MLP_SCALER is not None and TORCH_AVAILABLE
+    rf_ready = _RF_MODEL is not None and _RF_SCALER is not None
+
+    # 兼容模式：RF 单引擎
+    if mode == "rf":
+        if rule_hit:
+            return 1, DECISION_RULE, "Rule命中->最终1"
+        feats = np.asarray(extract_features(text), dtype=np.float64).reshape(1, -1)
+        if not rf_ready:
+            raise RuntimeError("RF 模型未就绪，无法执行 engine='rf' 预测。")
+        rf_pred = _clamp_level(_predict_with_rf(feats))
+        return rf_pred, DECISION_RF, f"RF直判({rf_pred})->最终{rf_pred}"
+
+    # 兼容模式：MLP 单引擎
+    if mode == "mlp":
+        if rule_hit:
+            return 1, DECISION_RULE, "Rule命中->最终1"
+        feats = np.asarray(extract_features(text), dtype=np.float64).reshape(1, -1)
+        if not mlp_ready:
+            raise RuntimeError("MLP 模型未就绪，无法执行 engine='mlp' 预测。")
+        mlp_pred = _clamp_level(_predict_with_mlp(feats))
+        return mlp_pred, DECISION_MLP, f"MLP直判({mlp_pred})->最终{mlp_pred}"
+
+    # 标准模式：异构级联（Hybrid）
+    if mode not in {"hybrid", "cascade"}:
+        raise ValueError("engine 参数仅支持 'hybrid'/'cascade' 或兼容模式 'rf'/'mlp'")
 
     feats = np.asarray(extract_features(text), dtype=np.float64).reshape(1, -1)
 
-    selected_engine = (engine or "rf").strip().lower()
+    # 并行分支 A：Rule 命中后仅交给 MLP 复核，不再串到 RF。
+    # 规则：
+    # - MLP 也判 1，则最终为 1；
+    # - MLP 判 2/3，则最终按 MLP 输出。
+    if rule_hit:
+        if not mlp_ready:
+            # 若 MLP 不可用，保留 Rule 兜底，避免服务不可用。
+            return 1, DECISION_RULE, "Rule命中->MLP不可用->Rule兜底(1)"
+        mlp_rule_pred = _clamp_level(_predict_with_mlp(feats))
+        if mlp_rule_pred == 1:
+            return 1, DECISION_MLP, "Rule命中->MLP复核(1)->最终1"
+        return mlp_rule_pred, DECISION_MLP, f"Rule命中->MLP复核({mlp_rule_pred})->最终{mlp_rule_pred}"
 
-    if selected_engine == "mlp":
-        pred = _predict_with_mlp(feats)
-    elif selected_engine == "rf":
-        pred = _predict_with_rf(feats)
+    # 并行分支 B：非 Rule 样本执行 MLP -> RF 级联。
+    if mlp_ready:
+        mlp_pred = _clamp_level(_predict_with_mlp(feats))
     else:
-        raise ValueError("engine 参数仅支持 'rf' 或 'mlp'")
+        # MLP 不可用时退化为 RF 决策。
+        if rf_ready:
+            rf_pred = _clamp_level(_predict_with_rf(feats))
+            return rf_pred, DECISION_RF, f"MLP不可用->RF直判({rf_pred})->最终{rf_pred}"
+        raise RuntimeError("MLP 与 RF 模型均未就绪，无法进行难度预测。")
 
-    # 对短硬核任务执行最终下限约束，避免双引擎共同掉到 Level 1。
-    if hard_floor > 0:
-        pred = max(pred, hard_floor)
+    # 第三关（RF 专家）：非 Rule 分支中由 RF 最终拍板。
+    # 规则：
+    # - 若 MLP=1 且 RF=1，最终才为 1；
+    # - 否则按 RF 输出。
+    if rf_ready:
+        rf_pred = _clamp_level(_predict_with_rf(feats))
+        if mlp_pred == 1 and rf_pred == 1:
+            return 1, DECISION_RF, "MLP初判(1)->RF复判(1)->最终1"
+        return rf_pred, DECISION_RF, f"MLP初判({mlp_pred})->RF复判({rf_pred})->最终{rf_pred}"
 
-    # 防御性兜底。
-    if pred < 1:
-        return 1
-    if pred > 3:
-        return 3
-    return pred
+    # RF 不可用时兜底：使用 MLP 结果。
+    return _clamp_level(mlp_pred), DECISION_MLP, f"MLP初判({mlp_pred})->RF不可用->最终{mlp_pred}"
+
+
+def predict_difficulty(prompt: str, engine: str = "hybrid") -> Tuple[int, str]:
+    """
+    兼容接口：返回 (difficulty, decision_engine)。
+    """
+    difficulty, decision_engine, _ = predict_difficulty_with_trace(prompt, engine=engine)
+    return difficulty, decision_engine
 
 
 if __name__ == "__main__":
@@ -362,12 +418,12 @@ if __name__ == "__main__":
         "解释这段代码的异常处理",
     ]
 
-    for eng in ["rf", "mlp"]:
-        print(f"\n=== Engine: {eng} ===")
-        for t in demo_texts:
-            try:
-                print(f"Prompt: {t}")
-                print(f"Pred: {predict_difficulty(t, engine=eng)}")
-            except Exception as exc:
-                print(f"Pred Error: {exc}")
-            print("-" * 50)
+    print("\n=== Heterogeneous Cascade Demo ===")
+    for t in demo_texts:
+        try:
+            pred, dec, flow = predict_difficulty_with_trace(t)
+            print(f"Prompt: {t}")
+            print(f"Pred: {pred}, Decision: {dec}, Flow: {flow}")
+        except Exception as exc:
+            print(f"Pred Error: {exc}")
+        print("-" * 50)

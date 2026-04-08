@@ -5,10 +5,9 @@ run_all_scenarios_benchmark.py
 
 目标：
 1. 自动构造四类场景题库（A/B/C/D）
-2. 为每个场景分别执行 RF 与 MLP 双引擎跑批
+2. 为每个场景执行一次混合级联路由跑批
 3. 输出结果到严格目录规范：
-   output/scenario_*/results_rf.csv
-   output/scenario_*/results_mlp.csv
+   output/scenario_*/results_hybrid.csv
 """
 
 from __future__ import annotations
@@ -19,9 +18,6 @@ import re
 from typing import Dict, List
 
 import pandas as pd
-
-from arbitrator_core import AdaptiveArbitrator
-from device_simulator import DeviceSimulator
 
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -125,26 +121,26 @@ def _medium_prompts_pool() -> List[str]:
         "请总结 DNS 域名解析的主要流程。",
         "请介绍缓存与数据库一致性的基本处理思路。",
         "请说明二叉树前序、中序、后序遍历的差异。",
-        "请将这句话翻译成英语：The experiment is reproducible.",
+        "请将这句话翻译成汉语：The experiment is reproducible.",
         "请简述 Linux 文件权限的基本含义。",
         "请解释对象存储与块存储的主要区别。",
         "请简要说明 CAP 理论的核心思想。",
-        "请将这句话翻译成英语：Latency is critical for edge devices.",
+        "请将这句话翻译成汉语：Latency is critical for edge devices.",
         "请总结微服务的主要优点与挑战。",
         "请解释 JWT 的基本原理与使用场景。",
         "请说明垃圾回收机制在程序中的作用。",
-        "请将这句话翻译成英语：Model routing should balance quality and cost.",
+        "请将这句话翻译成汉语：Model routing should balance quality and cost.",
         "请总结 SQL 与 NoSQL 数据库的关键区别。",
         "请解释线程池技术的优势与注意点。",
         "请简述虚拟内存机制的作用。",
-        "请将这句话翻译成英语：This system supports dynamic degradation.",
+        "请将这句话翻译成汉语：This system supports dynamic degradation.",
         "请总结 CDN 在互联网系统中的核心价值。",
         "请解释 API 幂等性的概念与工程意义。",
         "请说明队列与栈在数据结构上的区别。",
-        "请将这句话翻译成英语：Please keep technical terms unchanged.",
+        "请将这句话翻译成汉语：Please keep technical terms unchanged.",
         "请总结可观测性的三大支柱。",
         "请解释重试机制与熔断机制之间的关系。",
-        "请将这句话翻译成英语：We need a robust benchmark pipeline.",
+        "请将这句话翻译成汉语：We need a robust benchmark pipeline.",
     ]
 
 
@@ -244,13 +240,13 @@ def _hallucination_prompts_pool() -> List[str]:
 def build_scenario_a_light() -> List[Dict[str, object]]:
     """
     场景A：90% 极简短文本（轻负载）。
-    共 40 条：36 条简单 + 4 条中等。
+    共 40 条：32 条简单 + 8 条中等。
     """
     simple_pool = _simple_prompts_pool()
     medium_pool = _medium_prompts_pool()
 
     prompts: List[Dict[str, object]] = []
-    for i in range(36):
+    for i in range(32):
         prompts.append(
             {
                 "id": f"A{i+1:02d}",
@@ -258,10 +254,10 @@ def build_scenario_a_light() -> List[Dict[str, object]]:
                 "ground_truth": 1,
             }
         )
-    for i in range(4):
+    for i in range(8):
         prompts.append(
             {
-                "id": f"A{36+i+1:02d}",
+                "id": f"A{32+i+1:02d}",
                 "prompt": medium_pool[i % len(medium_pool)],
                 "ground_truth": 2,
             }
@@ -296,7 +292,7 @@ def build_scenario_c_hallucination() -> List[Dict[str, object]]:
     for i in range(40):
         text = pool[i % len(pool)]
         # 翻译类按中等标注，代码类按困难标注
-        gt = 2 if "翻译成英语" in text else 3
+        gt = 2 if ("翻译成英语" in text or "翻译成汉语" in text) else 3
         prompts.append(
             {
                 "id": f"C{i+1:02d}",
@@ -355,6 +351,10 @@ def run_single_engine(
     """
     在单个场景下运行单个引擎（RF 或 MLP）。
     """
+    # 懒加载重依赖，避免仅做“题库/标注复用”时触发模型初始化副作用。
+    from arbitrator_core import AdaptiveArbitrator
+    from device_simulator import DeviceSimulator
+
     simulator = DeviceSimulator(battery=100.0, temperature=35.0)
     arbitrator = AdaptiveArbitrator(device_simulator=simulator, routing_engine=engine)
 
@@ -376,6 +376,8 @@ def run_single_engine(
         total_latency = float(result.get("total_latency", 0.0))
         avg_tps = float(result.get("avg_tps", 0.0))
         pred_diff = int(result.get("difficulty", 1))
+        decision_engine = str(result.get("decision_engine", "Unknown"))
+        decision_flow = str(result.get("decision_flow", "")).strip()
         safety_score = float(result.get("safety_score", 0.0))
 
         # 兼容旧逻辑：每轮请求后额外冷却一次，模拟请求间隙。
@@ -390,6 +392,8 @@ def run_single_engine(
             "输入Prompt": prompt,
             "真实难度标签": gt,
             "系统预估难度": pred_diff,
+            "仲裁引擎": decision_engine,
+            "判定流程": decision_flow,
             "真实调用链路": call_chain_text,
             "最终调用模型": final_model,
             "最终总耗时": round(total_latency, 4),
@@ -402,8 +406,8 @@ def run_single_engine(
         records.append(record)
 
         print(
-            f"  [{idx:02d}/{total}] 预测={pred_diff} 真值={gt} "
-            f"耗时={total_latency:.3f}s 电量={state['battery']:.2f}% 温度={state['temperature']:.2f}°C"
+            f"  [{idx:02d}/{total}] 预测={pred_diff}({decision_flow}) 真值={gt} "
+            f"耗时={total_latency:.3f}s TPS={avg_tps:.4f} 电量={state['battery']:.2f}% 温度={state['temperature']:.2f}°C"
         )
 
     out_csv = os.path.join(scenario_dir, f"results_{engine}.csv")
@@ -424,9 +428,8 @@ def main() -> None:
         scenario_dir = os.path.join(OUTPUT_ROOT, scenario_name)
         os.makedirs(scenario_dir, exist_ok=True)
 
-        # 双引擎对撞：RF + MLP
-        run_single_engine(qbank, engine="rf", scenario_dir=scenario_dir)
-        run_single_engine(qbank, engine="mlp", scenario_dir=scenario_dir)
+        # 单次运行：异构级联路由（Rule -> MLP -> RF）
+        run_single_engine(qbank, engine="hybrid", scenario_dir=scenario_dir)
 
     print("[INFO] 四大场景跑批完成。")
 

@@ -131,6 +131,13 @@ class ScenarioVisualizer:
             if missing:
                 raise ValueError(f"{name} 结果缺少列：{missing}")
 
+            # 新增：读取异构级联决策引擎（Rule/MLP/RF）。
+            # 为兼容旧 CSV，若缺失则填充 Unknown。
+            if "仲裁引擎" not in df.columns:
+                df["仲裁引擎"] = "Unknown"
+            else:
+                df["仲裁引擎"] = df["仲裁引擎"].fillna("Unknown").astype(str).str.strip()
+
             for col in ["系统预估难度", "真实难度标签", "最终总耗时", "执行后电量", "执行后温度"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -308,12 +315,27 @@ class ScenarioVisualizer:
         throttle_cnt = int(sorted_df["真实调用链路"].astype(str).map(lambda x: x.count("[受限降级]")).sum())
         quality_retry_cnt = int(sorted_df["真实调用链路"].astype(str).map(lambda x: x.count("[质量拦截:")).sum())
 
+        total_rows = max(1, len(sorted_df))
+        decision_counts = sorted_df["仲裁引擎"].astype(str).value_counts()
+        rule_ratio = float(decision_counts.get("Rule", 0) / total_rows * 100.0)
+        mlp_ratio = float(decision_counts.get("MLP", 0) / total_rows * 100.0)
+        rf_ratio = float(decision_counts.get("RF", 0) / total_rows * 100.0)
+        dominant_decision = (
+            decision_counts.idxmax()
+            if len(decision_counts) > 0
+            else "Unknown"
+        )
+
         return {
             "总耗时": total_time,
             "总耗电": total_battery_drop,
             "最高温度": max_temp,
             "级联降频触发次数": throttle_cnt,
             "质量重试触发次数": quality_retry_cnt,
+            "主导仲裁引擎": dominant_decision,
+            "Rule占比": rule_ratio,
+            "MLP占比": mlp_ratio,
+            "RF占比": rf_ratio,
         }
 
     def generate_summary_table(self, rf: pd.DataFrame, mlp: pd.DataFrame, scenario_dir: str) -> str:
@@ -324,14 +346,63 @@ class ScenarioVisualizer:
         mlp_sum = self._aggregate_summary(mlp)
 
         lines = [
-            "| 引擎 | 总耗时(秒) | 总耗电(%) | 最高温度(°C) | 级联降频触发次数 | 质量重试触发次数 |",
-            "|---|---:|---:|---:|---:|---:|",
-            f"| RF | {rf_sum['总耗时']:.4f} | {rf_sum['总耗电']:.4f} | {rf_sum['最高温度']:.2f} | {int(rf_sum['级联降频触发次数'])} | {int(rf_sum['质量重试触发次数'])} |",
-            f"| MLP | {mlp_sum['总耗时']:.4f} | {mlp_sum['总耗电']:.4f} | {mlp_sum['最高温度']:.2f} | {int(mlp_sum['级联降频触发次数'])} | {int(mlp_sum['质量重试触发次数'])} |",
+            "| 引擎 | 主导仲裁引擎 | Rule占比(%) | MLP占比(%) | RF占比(%) | 总耗时(秒) | 总耗电(%) | 最高温度(°C) | 级联降频触发次数 | 质量重试触发次数 |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+            f"| RF | {rf_sum['主导仲裁引擎']} | {rf_sum['Rule占比']:.2f} | {rf_sum['MLP占比']:.2f} | {rf_sum['RF占比']:.2f} | {rf_sum['总耗时']:.4f} | {rf_sum['总耗电']:.4f} | {rf_sum['最高温度']:.2f} | {int(rf_sum['级联降频触发次数'])} | {int(rf_sum['质量重试触发次数'])} |",
+            f"| MLP | {mlp_sum['主导仲裁引擎']} | {mlp_sum['Rule占比']:.2f} | {mlp_sum['MLP占比']:.2f} | {mlp_sum['RF占比']:.2f} | {mlp_sum['总耗时']:.4f} | {mlp_sum['总耗电']:.4f} | {mlp_sum['最高温度']:.2f} | {int(mlp_sum['级联降频触发次数'])} | {int(mlp_sum['质量重试触发次数'])} |",
         ]
         content = "\n".join(lines) + "\n"
 
         out = os.path.join(scenario_dir, "scenario_summary.md")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(content)
+        return out
+
+    def generate_case_study_table(self, rf: pd.DataFrame, mlp: pd.DataFrame, scenario_dir: str) -> str:
+        """
+        提取场景典型样本并输出 Case Study Markdown 表。
+
+        表头包含：
+        | Prompt | 仲裁引擎 | 预测难度 | 真实执行链路 | 最终温度 |
+        """
+        merged = pd.concat([rf.copy(), mlp.copy()], ignore_index=True)
+        merged = merged.sort_values("题号数字")
+        merged["链路文本"] = merged["真实调用链路"].astype(str)
+
+        # 优先挑选触发关键机制的样本：质量拦截 / 受限降级 / 云端兜底。
+        core_mask = (
+            merged["链路文本"].str.contains(r"\[质量拦截:", regex=True)
+            | merged["链路文本"].str.contains(r"\[受限降级\]", regex=True)
+            | merged["链路文本"].str.contains(r"\[云端兜底卸载\]", regex=True)
+        )
+        core_df = merged[core_mask].copy()
+
+        # 若触发样本不足，补充高温样本，保证表格至少有代表性条目。
+        if len(core_df) < 5:
+            remain_df = merged[~core_mask].copy().sort_values("执行后温度", ascending=False)
+            need = 5 - len(core_df)
+            core_df = pd.concat([core_df, remain_df.head(max(0, need))], ignore_index=True)
+
+        # 最多展示 5 条，提升论文排版可读性。
+        core_df = core_df.head(5).copy()
+
+        lines = [
+            "| 实验引擎 | Prompt | 仲裁引擎 | 预测难度 | 真实执行链路 | 最终温度 |",
+            "|---|---|---|---:|---|---:|",
+        ]
+        for _, row in core_df.iterrows():
+            run_engine = str(row.get("引擎", "Unknown"))
+            prompt = str(row.get("输入Prompt", "")).replace("|", " ").replace("\n", " ").strip()
+            decision_engine = str(row.get("仲裁引擎", "Unknown"))
+            pred = int(row.get("系统预估难度", 0))
+            chain = str(row.get("真实调用链路", "")).replace("|", " ").replace("\n", " ").strip()
+            temp = float(row.get("执行后温度", 0.0))
+            lines.append(
+                f"| {run_engine} | {prompt} | {decision_engine} | {pred} | {chain} | {temp:.2f} |"
+            )
+
+        content = "\n".join(lines) + "\n"
+        out = os.path.join(scenario_dir, "case_study.md")
         with open(out, "w", encoding="utf-8") as f:
             f.write(content)
         return out
@@ -348,6 +419,7 @@ class ScenarioVisualizer:
             self.plot_latency_boxplot(rf, mlp, scenario_dir),
             self.plot_routing_distribution(rf, mlp, scenario_dir),
             self.generate_summary_table(rf, mlp, scenario_dir),
+            self.generate_case_study_table(rf, mlp, scenario_dir),
         ]
         return outputs
 

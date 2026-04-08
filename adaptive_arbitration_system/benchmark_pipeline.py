@@ -6,7 +6,7 @@ benchmark_pipeline.py
 2. 逐题调用 adaptive_process()。
 3. 每题后调用 cool_down()。
 4. 收集关键指标并导出 CSV。
-5. 支持路由引擎切换（RF / MLP）以做消融对比。
+5. 使用混合级联路由（Rule / MLP / RF）执行单次跑批。
 """
 
 from __future__ import annotations
@@ -92,9 +92,12 @@ def export_results_to_csv(rows: List[Dict[str, object]], output_path: str) -> No
     - 题号
     - 输入Prompt
     - 系统预估难度
+    - 仲裁引擎
+    - 判定流程
     - 真实难度标签
     - 真实调用链路
     - 最终总耗时
+    - 平均TPS
     - 执行后电量
     - 执行后温度
     - 最终模型回复
@@ -103,9 +106,12 @@ def export_results_to_csv(rows: List[Dict[str, object]], output_path: str) -> No
         "题号",
         "输入Prompt",
         "系统预估难度",
+        "仲裁引擎",
+        "判定流程",
         "真实难度标签",
         "真实调用链路",
         "最终总耗时",
+        "平均TPS",
         "执行后电量",
         "执行后温度",
         "最终模型回复",
@@ -118,15 +124,15 @@ def export_results_to_csv(rows: List[Dict[str, object]], output_path: str) -> No
 
 
 def run_benchmark(
-    output_csv_name: str = "arbitration_results_rf.csv",
-    routing_engine: str = "rf",
+    output_csv_name: str = "arbitration_results_hybrid.csv",
+    routing_engine: str = "hybrid",
 ) -> List[Dict[str, object]]:
     """
     执行完整的批量实验流程。
 
     参数：
     - output_csv_name: 导出文件名
-    - routing_engine: 路由引擎类型，支持 'rf' / 'mlp'
+    - routing_engine: 路由引擎类型，当前建议使用 'hybrid'
 
     返回：
     - 包含每条样本统计数据的列表（同时也会写入 CSV）。
@@ -155,6 +161,8 @@ def run_benchmark(
         avg_tps = float(result.get("avg_tps", 0.0))
         call_chain = result.get("call_chain", [])
         difficulty = int(result.get("difficulty", 1))
+        decision_engine = str(result.get("decision_engine", "Unknown"))
+        decision_flow = str(result.get("decision_flow", "")).strip()
 
         # CSV 对换行符敏感，写入前必须清洗为单行文本。
         clean_answer = answer.replace("\n", " ").replace("\r", " ").strip()
@@ -170,9 +178,12 @@ def run_benchmark(
             "题号": item["id"],
             "输入Prompt": prompt,
             "系统预估难度": difficulty,
+            "仲裁引擎": decision_engine,
+            "判定流程": decision_flow,
             "真实难度标签": ground_truth,
             "真实调用链路": chain_str,
             "最终总耗时": round(total_latency, 4),
+            "平均TPS": round(avg_tps, 4),
             "执行后电量": battery_after,
             "执行后温度": temperature_after,
             "最终模型回复": clean_answer,
@@ -181,7 +192,7 @@ def run_benchmark(
 
         print(
             f"[{index:02d}/{total_count}] "
-            f"真值={ground_truth} | 预测={difficulty} | 链路={chain_str} | "
+            f"真值={ground_truth} | 预测={difficulty}({decision_flow}) | 链路={chain_str} | "
             f"耗时={total_latency:.4f}s | 平均TPS={avg_tps:.4f} | "
             f"电量={battery_after:>6.2f}% | 温度={temperature_after:>5.2f}℃"
         )
@@ -196,8 +207,5 @@ def run_benchmark(
 
 
 if __name__ == "__main__":
-    # 第一次：随机森林引擎
-    run_benchmark(output_csv_name="arbitration_results_rf.csv", routing_engine="rf")
-
-    # 第二次：MLP 引擎（重新 run 时会自动满电重置 simulator）
-    run_benchmark(output_csv_name="arbitration_results_mlp.csv", routing_engine="mlp")
+    # 单次运行：异构级联路由（Rule -> MLP -> RF）
+    run_benchmark(output_csv_name="arbitration_results_hybrid.csv", routing_engine="hybrid")

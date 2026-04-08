@@ -5,6 +5,7 @@ arbitrator_core.py
 1. 融合“难度预测 + Safety Score”进行动态路由与自适应降级。
 2. 通过零参数轻量质量评估器执行端侧低开销回复验收。
 3. 在每次调用后进行状态回写，形成“时间-能耗-温度-路由”闭环。
+4. 当端侧无法继续升级且回答仍不合格时，触发云端兜底卸载。
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from typing import Dict, List, Optional, Tuple
 
 from config_and_api import LLMAPIError, call_llm
 from device_simulator import DeviceSimulator
-from ml_router_upgrade.feature_extractor import predict_difficulty
+from ml_router_upgrade.feature_extractor import predict_difficulty_with_trace
 
 
 MODEL_ORDER = ["qwen-0.5b", "llama-1b", "qwen-1.5b"]
@@ -38,6 +39,9 @@ ACK_WORDS = {
     "ok",
     "okay",
 }
+
+CLOUD_FALLBACK_TEXT = "这是由云端大模型 API 生成的高质量兜底回答。"
+CLOUD_FALLBACK_LATENCY = 1.2
 
 
 def _detect_severe_repetition(answer: str) -> bool:
@@ -109,6 +113,22 @@ def evaluate_answer_quality(prompt: str, answer: str) -> Tuple[bool, str]:
         return False, "模型拒答"
 
     return True, "OK"
+
+
+def call_cloud_api(prompt: str) -> Tuple[str, float, float]:
+    """
+    Mock 云端 API 调用。
+
+    返回：
+    - answer: 云端高质量兜底回复
+    - latency: 固定网络延迟（秒）
+    - tps: -1（云端不计入本地算力 TPS）
+
+    关键约束：
+    - 云端调用不应更新本地设备状态（不扣电、不升温）。
+    """
+    _ = prompt  # 预留参数，便于后续替换为真实云端请求
+    return CLOUD_FALLBACK_TEXT, CLOUD_FALLBACK_LATENCY, -1.0
 
 
 class AdaptiveArbitrator:
@@ -209,7 +229,8 @@ class AdaptiveArbitrator:
         - 引入基于时间的动态能耗与冷却模型。
         - 每次调用后立刻用耗时回写仿真状态（含异常/被拦截场景）。
         """
-        difficulty = predict_difficulty(prompt, engine=self.routing_engine)
+        # 难度预测改为“异构级联路由”，返回 (难度, 决策引擎, 判定流程)。
+        difficulty, decision_engine, decision_flow = predict_difficulty_with_trace(prompt)
         chain_logs: List[str] = []
 
         total_latency = 0.0
@@ -265,26 +286,34 @@ class AdaptiveArbitrator:
                 chain_logs.append("[质量通过]")
                 break
 
-            chain_logs.append(f"[质量拦截:{quality_reason}]")
-
-            # 到达最大模型则妥协接受，避免死循环。
-            if current_model == "qwen-1.5b":
-                final_answer = f"[妥协输出]{(answer or '').strip()}"
-                chain_logs.append("qwen-1.5b[妥协输出]")
-                break
+            chain_logs.append(f"{current_model} [质量拦截:{quality_reason}]")
 
             # 根据最新状态动态判断是否还能升级。
             now_score = self._get_safety_score()
             max_model = self._max_model_for_request(difficulty, now_score)
             next_model = self._next_model(current_model)
+            can_upgrade = MODEL_ORDER.index(next_model) <= MODEL_ORDER.index(max_model) and next_model != current_model
 
-            if MODEL_ORDER.index(next_model) <= MODEL_ORDER.index(max_model):
+            if can_upgrade:
                 chain_logs.append(f"[升级重试]{current_model}->{next_model}(score={now_score:.2f})")
                 current_model = next_model
                 continue
 
-            chain_logs.append(f"[受限降级]score={now_score:.2f},无法升级到:{next_model}")
-            final_answer = f"[受硬件限制，无法继续升级]{(answer or '').strip()}"
+            # 触发云端兜底条件：
+            # 1) 已到端侧最大模型（如 1.5b）仍不合格；
+            # 2) 当前安全分限制导致无法继续升级。
+            if current_model == "qwen-1.5b":
+                chain_logs.append("[受限/妥协]端侧最高模型仍不达标")
+            else:
+                chain_logs.append(f"[受限/妥协]score={now_score:.2f},无法升级到:{next_model}")
+
+            chain_logs.append("[云端兜底卸载]")
+            cloud_answer, cloud_latency, cloud_tps = call_cloud_api(prompt)
+            total_latency += max(0.0, float(cloud_latency))
+            if cloud_tps > 0:
+                tps_values.append(float(cloud_tps))
+            final_answer = cloud_answer.strip()
+            chain_logs.append("Cloud-API [成功]")
             break
 
         avg_tps = sum(tps_values) / len(tps_values) if tps_values else 0.0
@@ -298,5 +327,7 @@ class AdaptiveArbitrator:
             "call_chain": chain_logs,  # 兼容旧调用方（列表）
             "call_chain_text": chain_text,  # 新增：直接可写入 CSV 的链路文本
             "difficulty": difficulty,
+            "decision_engine": decision_engine,
+            "decision_flow": decision_flow,
             "safety_score": round(final_score, 4),
         }

@@ -181,8 +181,9 @@ def evaluate_engines(eval_df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.
     """
     y_true = eval_df["label"].to_numpy(dtype=np.int64)
 
-    rf_pred = np.array([predict_difficulty(p, engine="rf") for p in eval_df["prompt"]], dtype=np.int64)
-    mlp_pred = np.array([predict_difficulty(p, engine="mlp") for p in eval_df["prompt"]], dtype=np.int64)
+    # predict_difficulty 已升级为返回 (难度, 决策引擎)
+    rf_pred = np.array([predict_difficulty(p, engine="rf")[0] for p in eval_df["prompt"]], dtype=np.int64)
+    mlp_pred = np.array([predict_difficulty(p, engine="mlp")[0] for p in eval_df["prompt"]], dtype=np.int64)
 
     return y_true, rf_pred, mlp_pred
 
