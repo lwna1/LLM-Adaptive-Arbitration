@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Pattern, Tuple
 
 from config_and_api import LLMAPIError, call_llm
 from device_simulator import DeviceSimulator
@@ -42,6 +42,59 @@ ACK_WORDS = {
 
 CLOUD_FALLBACK_TEXT = "这是由云端大模型 API 生成的高质量兜底回答。"
 CLOUD_FALLBACK_LATENCY = 1.2
+
+_HAS_LATIN_TEXT_PATTERN = re.compile(r"[A-Za-z\u00C0-\u024F\u1E00-\u1EFF]")
+_HAS_CJK_TEXT_PATTERN = re.compile(r"[\u4E00-\u9FFF]")
+_HAS_JAPANESE_TEXT_PATTERN = re.compile(r"[\u3040-\u30FF\u4E00-\u9FFF]")
+_HAS_KOREAN_TEXT_PATTERN = re.compile(r"[\uAC00-\uD7AF]")
+_HAS_CYRILLIC_TEXT_PATTERN = re.compile(r"[\u0400-\u04FF]")
+_HAS_ARABIC_TEXT_PATTERN = re.compile(r"[\u0600-\u06FF]")
+_LATIN_TOKEN_PATTERN = re.compile(r"[A-Za-z\u00C0-\u024F\u1E00-\u1EFF]+")
+
+# 翻译任务目标语言推断规则。
+# 说明：
+# - 这里做的是“目标语种/语系存在性校验”，不是完整语言识别。
+# - 对英语/法语/西班牙语/德语等拉丁字母语种，统一按 Latin Script 检查。
+TRANSLATION_TARGET_RULES: List[Tuple[str, Tuple[str, ...], Pattern[str]]] = [
+    ("英文", ("英语", "英文", "english"), _HAS_LATIN_TEXT_PATTERN),
+    ("中文", ("中文", "汉语", "汉字", "chinese"), _HAS_CJK_TEXT_PATTERN),
+    ("法语", ("法语", "法文", "french"), _HAS_LATIN_TEXT_PATTERN),
+    ("西班牙语", ("西班牙语", "西语", "spanish"), _HAS_LATIN_TEXT_PATTERN),
+    ("德语", ("德语", "德文", "german"), _HAS_LATIN_TEXT_PATTERN),
+    ("意大利语", ("意大利语", "italian"), _HAS_LATIN_TEXT_PATTERN),
+    ("葡萄牙语", ("葡萄牙语", "portuguese"), _HAS_LATIN_TEXT_PATTERN),
+    ("日语", ("日语", "日文", "japanese"), _HAS_JAPANESE_TEXT_PATTERN),
+    ("韩语", ("韩语", "韩文", "korean"), _HAS_KOREAN_TEXT_PATTERN),
+    ("俄语", ("俄语", "俄文", "russian"), _HAS_CYRILLIC_TEXT_PATTERN),
+    ("阿拉伯语", ("阿拉伯语", "arabic"), _HAS_ARABIC_TEXT_PATTERN),
+]
+
+TRANSLATION_META_PATTERNS: List[Pattern[str]] = [
+    re.compile(r"请提供"),
+    re.compile(r"请输入"),
+    re.compile(r"我会翻译"),
+    re.compile(r"按照输入"),
+    re.compile(r"根据输入"),
+    re.compile(r"请您让我"),
+    re.compile(r"please provide", re.IGNORECASE),
+    re.compile(r"provide the input", re.IGNORECASE),
+    re.compile(r"i will translate", re.IGNORECASE),
+    re.compile(r"go ahead and provide", re.IGNORECASE),
+    re.compile(r"following your intended meaning", re.IGNORECASE),
+]
+
+# 对常见拉丁字母目标语言增加轻量“目标语言痕迹”校验。
+# 说明：
+# - 仅在多词输出时启用，避免误伤单词/短语级翻译。
+# - 这些标记词不是完整语言识别，只用于拦截明显错语种或英文混充。
+TRANSLATION_LANGUAGE_MARKERS: Dict[str, Pattern[str]] = {
+    "英文": re.compile(r"\b(the|is|are|to|and|of|in|for|with|this|that|can|need|please|should)\b", re.IGNORECASE),
+    "法语": re.compile(r"\b(le|la|les|un|une|des|et|est|pour|avec|dans|que|vous|nous)\b|[àâçéèêëîïôùûüÿœæ]", re.IGNORECASE),
+    "西班牙语": re.compile(r"\b(el|la|los|las|un|una|y|es|para|con|que|como|por|usted|nosotros)\b|[áéíóúñ¿¡]", re.IGNORECASE),
+    "德语": re.compile(r"\b(der|die|das|ein|eine|und|ist|nicht|mit|für|ich|wir|sie|zu|auf|bitte|deutsch|deutsche|übersetzen)\b|[äöüß]", re.IGNORECASE),
+    "意大利语": re.compile(r"\b(il|lo|la|gli|le|un|una|e|è|per|con|che|non|noi|voi)\b|[àèéìíîòóù]", re.IGNORECASE),
+    "葡萄牙语": re.compile(r"\b(o|a|os|as|um|uma|e|é|para|com|que|não|nos|vocês)\b|[áâãàçéêíóôõú]", re.IGNORECASE),
+}
 
 
 def _detect_severe_repetition(answer: str) -> bool:
@@ -75,6 +128,98 @@ def _detect_severe_repetition(answer: str) -> bool:
     return False
 
 
+def _infer_translation_target(prompt: str) -> Optional[Tuple[str, Pattern[str]]]:
+    """
+    从翻译任务中推断目标语言。
+
+    策略：
+    - 仅在包含“翻译/译成/译为”等意图时启用
+    - 若 prompt 中出现多个语言关键词，取最后出现的一个
+      以兼容“从英语翻译成法语”这类同时包含源语言与目标语言的表达
+    """
+    text = (prompt or "").strip()
+    lowered = text.lower()
+
+    if not any(keyword in text for keyword in ["翻译", "译成", "译为"]):
+        return None
+
+    best_match: Optional[Tuple[int, str, Pattern[str]]] = None
+    for label, aliases, validator in TRANSLATION_TARGET_RULES:
+        for alias in aliases:
+            index = lowered.rfind(alias.lower())
+            if index < 0:
+                continue
+            if best_match is None or index > best_match[0]:
+                best_match = (index, label, validator)
+
+    if best_match is None:
+        return None
+    return best_match[1], best_match[2]
+
+
+def _translation_meta_response_detected(answer: str) -> bool:
+    text = (answer or "").strip()
+    if not text:
+        return False
+    return any(pattern.search(text) is not None for pattern in TRANSLATION_META_PATTERNS)
+
+
+def _validate_translation_target_content(target_label: str, answer: str) -> Optional[str]:
+    """
+    对翻译结果做更严格的目标语言形态校验。
+
+    返回：
+    - None: 通过
+    - str: 失败原因
+    """
+    answer_text = (answer or "").strip()
+    latin_chars = len(_HAS_LATIN_TEXT_PATTERN.findall(answer_text))
+    cjk_chars = len(_HAS_CJK_TEXT_PATTERN.findall(answer_text))
+    latin_tokens = _LATIN_TOKEN_PATTERN.findall(answer_text)
+
+    if target_label in TRANSLATION_LANGUAGE_MARKERS:
+        if latin_chars <= 0:
+            return f"翻译任务缺少{target_label}内容"
+
+        # 非中文目标语下，若中文明显多于目标语内容，通常是回显原文或夹带解释。
+        if cjk_chars >= 4 and cjk_chars > latin_chars:
+            return "翻译结果疑似仍以中文或提示词回显为主"
+
+        if _translation_meta_response_detected(answer_text):
+            return "翻译结果疑似未执行而是回显指令"
+
+        marker_pattern = TRANSLATION_LANGUAGE_MARKERS[target_label]
+        # 对较长输出要求至少出现一些目标语言痕迹，防止英文/杂糅文本混充德语/西语等。
+        if len(latin_tokens) >= 4 and marker_pattern.search(answer_text) is None:
+            return f"翻译结果缺少明显{target_label}语言特征"
+
+        return None
+
+    if target_label == "中文":
+        if cjk_chars <= 0:
+            return "翻译任务缺少中文内容"
+        if cjk_chars < 2 and latin_chars > cjk_chars * 3:
+            return "翻译结果疑似仍以外文为主"
+        return None
+
+    if target_label in {"日语", "韩语", "俄语", "阿拉伯语"}:
+        pattern = {
+            "日语": _HAS_JAPANESE_TEXT_PATTERN,
+            "韩语": _HAS_KOREAN_TEXT_PATTERN,
+            "俄语": _HAS_CYRILLIC_TEXT_PATTERN,
+            "阿拉伯语": _HAS_ARABIC_TEXT_PATTERN,
+        }[target_label]
+        if pattern.search(answer_text) is None:
+            return f"翻译任务缺少{target_label}内容"
+        if target_label != "日语" and cjk_chars >= 4:
+            return "翻译结果疑似仍以中文或提示词回显为主"
+        if _translation_meta_response_detected(answer_text):
+            return "翻译结果疑似未执行而是回显指令"
+        return None
+
+    return None
+
+
 def evaluate_answer_quality(prompt: str, answer: str) -> Tuple[bool, str]:
     """
     零参数轻量级质量评估器。
@@ -89,12 +234,14 @@ def evaluate_answer_quality(prompt: str, answer: str) -> Tuple[bool, str]:
     if not answer_text:
         return False, "空回复"
 
+    translation_target = _infer_translation_target(prompt_text)
+
     # 1) 复读机检测
     if _detect_severe_repetition(answer_text):
         return False, "复读机输出"
 
     # 2) 长问短答（并排除简单确认词）
-    if len(prompt_text) > 20 and len(answer_text) < 10:
+    if translation_target is None and len(prompt_text) > 20 and len(answer_text) < 10:
         if answer_text.lower() not in ACK_WORDS and answer_text not in ACK_WORDS:
             return False, "长问短答且疑似敷衍"
 
@@ -104,9 +251,13 @@ def evaluate_answer_quality(prompt: str, answer: str) -> Tuple[bool, str]:
         if "```" not in answer_text:
             return False, "代码任务缺少代码块"
 
-    if any(key in prompt_text for key in ["翻译", "英语"]):
-        if re.search(r"[A-Za-z]", answer_text) is None:
-            return False, "翻译任务缺少英文内容"
+    if translation_target is not None:
+        target_label, target_pattern = translation_target
+        if target_pattern.search(answer_text) is None:
+            return False, f"翻译任务缺少{target_label}内容"
+        translation_reason = _validate_translation_target_content(target_label, answer_text)
+        if translation_reason is not None:
+            return False, translation_reason
 
     # 4) 拒答检测
     if any(pattern in answer_text for pattern in REFUSAL_PATTERNS):
